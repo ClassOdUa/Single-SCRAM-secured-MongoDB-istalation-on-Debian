@@ -1,0 +1,157 @@
+---
+- name: Configure Fresh Debian Installation with MongoDB
+  hosts: all
+  become: true
+  vars:
+    # MongoDB Variables
+    mongodb_version: "6.0"  # MongoDB version to install
+    mongodb_user: "mongoadmin"  # MongoDB admin user
+    mongodb_password: "mongoadmin_password"  # MongoDB admin password
+    mongodb_database: "admin"  # MongoDB admin database
+    mongodb_port: 27017  # MongoDB port
+    mongodb_bind_ip: "0.0.0.0" # MongoDB bind IP (0.0.0.0 to allow remote connections)
+
+    # Non-root User Variables
+    non_root_user: "new_linux_user"  # New non-root user
+    non_root_password: "linux_user_password"  # Password for the new non-root user
+    # Public Key Variable
+    user_public_key: "/path/to/ssh_key.pub"  # Replace with the path to your public key
+
+
+  tasks:
+    - name: Update and Upgrade Debian Packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Install Required Packages
+      apt:
+        name:
+          - gnupg
+          - curl
+          - sudo
+        state: present
+
+    - name: Get the correct path of sudo
+      set_fact:
+        sudo_path: "{{ ansible_playbook_python | dirname }}/sudo"
+
+    - name: Import MongoDB public GPG Key
+      shell: |
+        {{ sudo_path }} curl -fsSL https://pgp.mongodb.com/server-{{ mongodb_version }}.asc | {{ sudo_path }} gpg --dearmor --output /usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg
+      args:
+        executable: /bin/bash
+
+    - name: Create MongoDB Repository File
+      blockinfile:
+        path: /etc/apt/sources.list.d/mongodb-org-{{ mongodb_version }}.list
+        create: yes
+        block: |
+          deb [ signed-by=/usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg ] http://repo.mongodb.org/apt/debian bullseye/mongodb-org/{{ mongodb_version }} main
+      notify: Update APT Cache
+
+    - name: Add New Non-Root User
+      user:
+        name: "{{ non_root_user }}"
+        password: "{{ non_root_password | password_hash('sha512', 'mysecretsalt') }}"
+        shell: /bin/bash
+        createhome: yes
+
+    - name: Add New User to sudoers
+      lineinfile:
+        path: /etc/sudoers
+        line: "{{ non_root_user }} ALL=(ALL:ALL) ALL"
+        validate: 'visudo -cf %s'
+
+    - name: Create .ssh folder for the new user
+      file:
+        path: "/home/{{ non_root_user }}/.ssh"
+        state: directory
+        mode: "0700"
+        owner: "{{ non_root_user }}"
+        group: "{{ non_root_user }}"
+
+    - name: Copy public key to authorized_keys
+      copy:
+        src: "{{ user_public_key }}"
+        dest: "/home/{{ non_root_user }}/.ssh/authorized_keys"
+        owner: "{{ non_root_user }}"
+        group: "{{ non_root_user }}"
+        mode: "0600"
+
+    - name: Change ownership of authorized_keys to the new user
+      file:
+        path: "/home/{{ non_root_user }}/.ssh/authorized_keys"
+        owner: "{{ non_root_user }}"
+        group: "{{ non_root_user }}"
+
+    - name: Install MongoDB Community Edition
+      apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
+      notify: Start MongoDB
+
+    - name: Start MongoDB
+      service:
+        name: mongod
+        state: started
+        enabled: yes
+
+    - name: Execute MongoDB createUser in mongosh
+      shell: |
+        echo 'use admin
+        db.createUser({
+          user: "{{ mongodb_user }}",
+          pwd: "{{ mongodb_password }}",
+          roles: [{ role: "root", db: "{{ mongodb_database }}" }]
+        })' | mongosh
+      args:
+        executable: /bin/bash
+      register: mongodb_user_creation
+
+    - name: Display MongoDB createUser error (if any)
+      debug:
+        var: mongodb_user_creation.stderr_lines
+      when: mongodb_user_creation.stderr_lines is defined and mongodb_user_creation.stderr_lines | length > 0
+
+    - name: Display MongoDB createUser output (if successful)
+      debug:
+        var: mongodb_user_creation.stdout_lines
+      when: mongodb_user_creation.stdout_lines is defined and mongodb_user_creation.stdout_lines | length > 0
+
+
+    - name: Edit /etc/mongod.conf to enable authorization
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^#security:'
+        line: 'security:'
+        insertafter: '^#security:'
+        state: present
+      when: ansible_distribution_major_version | int >= 11
+
+    - name: Edit /etc/mongod.conf to set authorization enabled
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^#security:'
+        line: '  authorization: "enabled"'
+        insertafter: '^security:'
+        state: present
+      when: ansible_distribution_major_version | int >= 11
+      notify: Restart MongoDB
+
+  handlers:
+    - name: Update APT Cache
+      apt:
+        update_cache: yes
+
+    - name: Start MongoDB
+      systemd:
+        name: mongod
+        state: started
+        enabled: yes
+
+    - name: Restart MongoDB
+      systemd:
+        name: mongod
+        state: restarted
